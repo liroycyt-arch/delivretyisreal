@@ -1,0 +1,122 @@
+# AE Cut - בניית "AE Cut Setup.exe" (Windows).
+# שים את הקובץ הזה ב:  .github/workflows/build.yml  (בענף הראשי של המאגר)
+# עובד גם אם קוד המקור נמצא בשורש המאגר, גם בתוך תיקייה (למשל effectcraft-main),
+# וגם אם העלית את AE-Cut-source.zip כקובץ אחד.
+# הרצה: Actions > Build AE Cut > Run workflow.  התוצאה: Artifacts > AE-Cut-Setup.
+name: Build AE Cut
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C target-feature=+crt-static"
+  EFFECTCRAFT_REQUIRE_WINRES: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the AE Cut source
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Recurse -Filter "AE-Cut-source.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zip -and -not (Get-ChildItem -Recurse -Filter Cargo.toml -Depth 2 | Where-Object { Test-Path (Join-Path $_.DirectoryName "apps/effectcraft/Cargo.toml") })) {
+            Expand-Archive -Path $zip.FullName -DestinationPath "$env:RUNNER_TEMP/src" -Force
+            $root = "$env:RUNNER_TEMP/src"
+          } else { $root = "." }
+          $cargo = Get-ChildItem -Path $root -Recurse -Filter Cargo.toml -Depth 3 | Where-Object { Test-Path (Join-Path $_.DirectoryName "apps/effectcraft/Cargo.toml") } | Select-Object -First 1
+          if (-not $cargo) { throw "Source not found: no folder with apps/effectcraft/Cargo.toml. Upload the AE Cut source (or AE-Cut-source.zip) to the repository." }
+          $src = $cargo.DirectoryName
+          Write-Output "Source: $src"
+          "SRC=$src" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Test-Path (Join-Path $src "packaging/windows/inno/aecut.iss"))) { throw "packaging/windows/inno/aecut.iss is missing in $src" }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.SRC }}
+          key: aecut-x64
+
+      - name: Build
+        shell: pwsh
+        working-directory: ${{ env.SRC }}
+        run: |
+          cargo build --release -p effectcraft --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Hebrew font (Rubik, OFL)
+        shell: pwsh
+        working-directory: ${{ env.SRC }}
+        run: |
+          New-Item -ItemType Directory -Force -Path stage/fonts | Out-Null
+          try {
+            Invoke-WebRequest -Uri "https://github.com/google/fonts/raw/main/ofl/rubik/Rubik%5Bwght%5D.ttf" -OutFile "stage/fonts/Rubik[wght].ttf"
+            Invoke-WebRequest -Uri "https://github.com/google/fonts/raw/main/ofl/rubik/OFL.txt" -OutFile "stage/fonts/OFL-Rubik.txt"
+          } catch { Write-Warning "Rubik download failed; bundled fonts will be used: $_" }
+
+      - name: Stage files
+        shell: pwsh
+        working-directory: ${{ env.SRC }}
+        run: |
+          New-Item -ItemType Directory -Force -Path stage/licenses | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/effectcraft.exe "stage/AE Cut.exe"
+          New-Item -ItemType File -Force -Path stage/setup.marker | Out-Null
+          foreach ($f in "LICENSE-MIT","LICENSE-APACHE","NOTICE","ATTRIBUTION.md") { if (Test-Path $f) { Copy-Item $f stage/licenses/ } }
+          if (Test-Path docs/licenses) { Copy-Item docs/licenses/* stage/licenses/ }
+          if (Test-Path docs/licenses/LICENSES.txt) { Copy-Item docs/licenses/LICENSES.txt stage/LICENSES.txt } else { "AE Cut - Liroy C" | Out-File stage/LICENSES.txt }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -and -not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+
+      - name: Build installer
+        shell: pwsh
+        working-directory: ${{ env.SRC }}
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $iscc = if (Get-Command iscc -ErrorAction SilentlyContinue) { "iscc" } else { "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DMyAppVersion=$v" packaging/windows/inno/aecut.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/out" | Out-Null
+          Copy-Item "dist/AE Cut Setup.exe" "$env:GITHUB_WORKSPACE/out/"
+
+      - name: Test - silent install and uninstall
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "AECutTest"
+          $p = Start-Process -FilePath "$env:GITHUB_WORKSPACE/out/AE Cut Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=desktopicon,assoc","/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "install exit code $($p.ExitCode)" }
+          foreach ($f in "AE Cut.exe","setup.marker","LICENSES.txt","unins000.exe") { if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" } }
+          $app = Start-Process -FilePath (Join-Path $dir "AE Cut.exe") -PassThru
+          Start-Sleep -Seconds 12
+          if ($app.HasExited) { Write-Warning "AE Cut exited early (code $($app.ExitCode)); a runner without GPU or display may cause this" } else { Write-Output "AE Cut stayed running 12s"; Stop-Process -Id $app.Id -Force }
+          Start-Process -FilePath (Join-Path $dir "unins000.exe") -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES" -Wait | Out-Null
+          Start-Sleep -Seconds 3
+          if (Test-Path (Join-Path $dir "AE Cut.exe")) { throw "uninstall left AE Cut.exe behind" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AE-Cut-Setup
+          path: out/AE Cut Setup.exe
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: ${{ env.SRC }}/build.log
+          if-no-files-found: ignore
