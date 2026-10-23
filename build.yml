@@ -1,0 +1,100 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_RELEASE: "4.3-stable"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Godot + export templates + rcedit + Rubik font
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://github.com/godotengine/godot-builds/releases/download/$env:GODOT_RELEASE"
+          New-Item -ItemType Directory -Force -Path tools | Out-Null
+          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_win64.exe.zip" -OutFile tools/godot.zip
+          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_export_templates.tpz" -OutFile tools/templates.zip
+          Invoke-WebRequest "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile tools/rcedit-x64.exe
+          Expand-Archive tools/godot.zip -DestinationPath tools/godot -Force
+          Expand-Archive tools/templates.zip -DestinationPath tools/tpl -Force
+          $tplDir = Join-Path $env:APPDATA "Godot/export_templates/$env:GODOT_VERSION.stable"
+          New-Item -ItemType Directory -Force -Path $tplDir | Out-Null
+          Copy-Item "tools/tpl/templates/*" $tplDir -Recurse -Force
+          # rcedit (מציב את האייקון בקובץ ה-EXE)
+          $rc = (Resolve-Path tools/rcedit-x64.exe).Path.Replace('\','/')
+          $cfgDir = Join-Path $env:APPDATA "Godot"
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          $cfg = "[gd_resource type=`"EditorSettings`" format=3]`n`n[resource]`nexport/windows/rcedit = `"$rc`"`n"
+          Set-Content -Path (Join-Path $cfgDir "editor_settings-4.3.tres") -Value $cfg -Encoding utf8
+          Set-Content -Path (Join-Path $cfgDir "editor_settings-4.tres") -Value $cfg -Encoding utf8
+          # פונט Rubik (רישיון OFL) אם לא קיים בפרויקט
+          if (-not (Test-Path fonts/Rubik.ttf)) {
+            New-Item -ItemType Directory -Force -Path fonts | Out-Null
+            Invoke-WebRequest "https://github.com/google/fonts/raw/main/ofl/rubik/Rubik%5Bwght%5D.ttf" -OutFile fonts/Rubik.ttf
+          }
+          $exe = Get-ChildItem tools/godot -Filter "Godot_v*_win64.exe" | Where-Object { $_.Name -notmatch "console" } | Select-Object -First 1
+          $con = Get-ChildItem tools/godot -Filter "*console.exe" | Select-Object -First 1
+          "GODOT=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GODOT_CONSOLE=$($con.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Import project resources
+        shell: pwsh
+        run: |
+          & "$env:GODOT_CONSOLE" --headless --path . --import 2>&1 | Tee-Object -FilePath import.log
+          exit 0
+
+      - name: Smoke test (בדיקת שגיאות סקריפט)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & "$env:GODOT_CONSOLE" --headless --path . --quit-after 120 2>&1 | Tee-Object -FilePath smoke.log
+          if (Select-String -Path smoke.log,import.log -Pattern "SCRIPT ERROR|Parse Error|Failed to load script|Compile Error") {
+            Write-Host "::error::נמצאו שגיאות סקריפט. ראה smoke.log / import.log ב-Artifacts"
+            exit 1
+          }
+
+      - name: Export Windows EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          & "$env:GODOT_CONSOLE" --headless --path . --export-release "Windows Desktop" build/IsraelDelivery.exe 2>&1 | Tee-Object -FilePath export.log
+          if (-not (Test-Path build/IsraelDelivery.exe)) {
+            Write-Host "::error::קובץ ה-EXE לא נוצר. ראה export.log"
+            exit 1
+          }
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/setup.iss
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IsraelDelivery-Windows
+          path: |
+            build/IsraelDelivery.exe
+            build/IsraelDelivery_Setup.exe
+            *.log
+          if-no-files-found: warn
+
+      - name: Publish release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/IsraelDelivery.exe
+            build/IsraelDelivery_Setup.exe
