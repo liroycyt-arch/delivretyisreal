@@ -13,122 +13,72 @@ env:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locate Godot project (project.godot)
+      - name: Download Godot + export templates + rcedit + Rubik font
         shell: pwsh
-        timeout-minutes: 2
-        run: |
-          Write-Host "--- repository files ---"
-          Get-ChildItem -Recurse -Depth 2 -Force | Where-Object { $_.FullName -notmatch '\\\.git\\' } | ForEach-Object { $_.FullName.Replace((Get-Location).Path, '.') }
-          $pf = Get-ChildItem -Recurse -Filter project.godot -File | Select-Object -First 1
-          if (-not $pf) {
-            Write-Host "::error::לא נמצא project.godot בריפו. יש להעלות את תוכן הפרויקט (project.godot, scripts, scenes...) ולא ZIP."
-            exit 1
-          }
-          $proj = $pf.Directory.FullName
-          foreach ($need in @("scenes/main.tscn", "scripts/main.gd", "scripts/game.gd")) {
-            if (-not (Test-Path (Join-Path $proj $need))) {
-              Write-Host "::error::חסר הקובץ $need בתוך $proj. ההעלאה לא שלמה."
-              exit 1
-            }
-          }
-          Write-Host "Project dir: $proj"
-          "PROJECT_DIR=$proj" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Download Godot, export templates, rcedit, Rubik font
-        shell: pwsh
-        timeout-minutes: 10
         run: |
           $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
           $base = "https://github.com/godotengine/godot-builds/releases/download/$env:GODOT_RELEASE"
           New-Item -ItemType Directory -Force -Path tools | Out-Null
-          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_win64.exe.zip" -OutFile tools/godot.zip -TimeoutSec 300
-          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_export_templates.tpz" -OutFile tools/templates.zip -TimeoutSec 600
-          Invoke-WebRequest "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile tools/rcedit-x64.exe -TimeoutSec 120
+          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_win64.exe.zip" -OutFile tools/godot.zip
+          Invoke-WebRequest "$base/Godot_v$($env:GODOT_RELEASE)_export_templates.tpz" -OutFile tools/templates.zip
+          Invoke-WebRequest "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile tools/rcedit-x64.exe
           Expand-Archive tools/godot.zip -DestinationPath tools/godot -Force
           Expand-Archive tools/templates.zip -DestinationPath tools/tpl -Force
           $tplDir = Join-Path $env:APPDATA "Godot/export_templates/$env:GODOT_VERSION.stable"
           New-Item -ItemType Directory -Force -Path $tplDir | Out-Null
           Copy-Item "tools/tpl/templates/*" $tplDir -Recurse -Force
+          # rcedit (מציב את האייקון בקובץ ה-EXE)
           $rc = (Resolve-Path tools/rcedit-x64.exe).Path.Replace('\','/')
           $cfgDir = Join-Path $env:APPDATA "Godot"
           New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
           $cfg = "[gd_resource type=`"EditorSettings`" format=3]`n`n[resource]`nexport/windows/rcedit = `"$rc`"`n"
           Set-Content -Path (Join-Path $cfgDir "editor_settings-4.3.tres") -Value $cfg -Encoding utf8
           Set-Content -Path (Join-Path $cfgDir "editor_settings-4.tres") -Value $cfg -Encoding utf8
-          $fonts = Join-Path $env:PROJECT_DIR "fonts"
-          New-Item -ItemType Directory -Force -Path $fonts | Out-Null
-          if (-not (Test-Path (Join-Path $fonts "Rubik.ttf"))) {
-            Invoke-WebRequest "https://github.com/google/fonts/raw/main/ofl/rubik/Rubik%5Bwght%5D.ttf" -OutFile (Join-Path $fonts "Rubik.ttf") -TimeoutSec 120
+          # פונט Rubik (רישיון OFL) אם לא קיים בפרויקט
+          if (-not (Test-Path fonts/Rubik.ttf)) {
+            New-Item -ItemType Directory -Force -Path fonts | Out-Null
+            Invoke-WebRequest "https://github.com/google/fonts/raw/main/ofl/rubik/Rubik%5Bwght%5D.ttf" -OutFile fonts/Rubik.ttf
           }
+          $exe = Get-ChildItem tools/godot -Filter "Godot_v*_win64.exe" | Where-Object { $_.Name -notmatch "console" } | Select-Object -First 1
           $con = Get-ChildItem tools/godot -Filter "*console.exe" | Select-Object -First 1
-          if (-not $con) { Write-Host "::error::Godot console exe not found"; exit 1 }
-          "GODOT_CONSOLE=$($con.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # סקריפט עזר: מריץ Godot עם timeout ומחסל אותו אם נתקע
-          $helper = @'
-          function Run-Godot([string[]]$ArgList, [string]$Log, [int]$Seconds) {
-            $p = Start-Process -FilePath $env:GODOT_CONSOLE -ArgumentList $ArgList -PassThru -NoNewWindow -RedirectStandardOutput $Log -RedirectStandardError "$Log.err"
-            if (-not $p.WaitForExit($Seconds * 1000)) {
-              Write-Host "TIMEOUT after $Seconds s - killing Godot"
-              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-              Get-Content $Log, "$Log.err" -ErrorAction SilentlyContinue | Select-Object -Last 60
-              return 124
-            }
-            Get-Content $Log, "$Log.err" -ErrorAction SilentlyContinue | Select-Object -Last 80
-            return $p.ExitCode
-          }
-          '@
-          Set-Content -Path tools/run.ps1 -Value $helper -Encoding utf8
+          "GODOT=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GODOT_CONSOLE=$($con.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Import project resources
         shell: pwsh
-        timeout-minutes: 8
         run: |
-          . ./tools/run.ps1
-          $code = Run-Godot @("--headless", "--path", $env:PROJECT_DIR, "--import") "import.log" 240
-          Write-Host "import exit code: $code"
+          & "$env:GODOT_CONSOLE" --headless --path . --import 2>&1 | Tee-Object -FilePath import.log
           exit 0
 
-      - name: Smoke test (script errors check)
+      - name: Smoke test (בדיקת שגיאות סקריפט)
         shell: pwsh
         continue-on-error: true
-        timeout-minutes: 4
         run: |
-          . ./tools/run.ps1
-          $code = Run-Godot @("--headless", "--path", $env:PROJECT_DIR, "--quit-after", "120") "smoke.log" 90
-          $bad = Select-String -Path import.log, import.log.err, smoke.log, smoke.log.err -Pattern "SCRIPT ERROR|Parse Error|Failed to load script|Compile Error" -ErrorAction SilentlyContinue
-          if ($bad) {
-            $bad | Select-Object -First 40 | ForEach-Object { Write-Host $_.Line }
-            Write-Host "::error::נמצאו שגיאות סקריפט. ראה smoke.log ב-Artifacts"
+          & "$env:GODOT_CONSOLE" --headless --path . --quit-after 120 2>&1 | Tee-Object -FilePath smoke.log
+          if (Select-String -Path smoke.log,import.log -Pattern "SCRIPT ERROR|Parse Error|Failed to load script|Compile Error") {
+            Write-Host "::error::נמצאו שגיאות סקריפט. ראה smoke.log / import.log ב-Artifacts"
             exit 1
           }
 
       - name: Export Windows EXE
         shell: pwsh
-        timeout-minutes: 12
         run: |
-          . ./tools/run.ps1
-          $out = Join-Path $env:PROJECT_DIR "build/IsraelDelivery.exe"
-          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-          $code = Run-Godot @("--headless", "--path", $env:PROJECT_DIR, "--export-release", "Windows Desktop", $out) "export.log" 480
-          Write-Host "export exit code: $code"
-          if (-not (Test-Path $out)) {
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          & "$env:GODOT_CONSOLE" --headless --path . --export-release "Windows Desktop" build/IsraelDelivery.exe 2>&1 | Tee-Object -FilePath export.log
+          if (-not (Test-Path build/IsraelDelivery.exe)) {
             Write-Host "::error::קובץ ה-EXE לא נוצר. ראה export.log"
             exit 1
           }
-          Write-Host ("EXE size: {0:N1} MB" -f ((Get-Item $out).Length / 1MB))
 
       - name: Build installer (Inno Setup)
         shell: pwsh
         continue-on-error: true
-        timeout-minutes: 8
         run: |
           choco install innosetup -y --no-progress
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (Join-Path $env:PROJECT_DIR "installer/setup.iss")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/setup.iss
 
       - name: Upload artifacts
         if: always()
@@ -136,10 +86,9 @@ jobs:
         with:
           name: IsraelDelivery-Windows
           path: |
-            ${{ env.PROJECT_DIR }}/build/IsraelDelivery.exe
-            ${{ env.PROJECT_DIR }}/build/IsraelDelivery_Setup.exe
+            build/IsraelDelivery.exe
+            build/IsraelDelivery_Setup.exe
             *.log
-            *.log.err
           if-no-files-found: warn
 
       - name: Publish release (on tag)
@@ -147,5 +96,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.PROJECT_DIR }}/build/IsraelDelivery.exe
-            ${{ env.PROJECT_DIR }}/build/IsraelDelivery_Setup.exe
+            build/IsraelDelivery.exe
+            build/IsraelDelivery_Setup.exe
